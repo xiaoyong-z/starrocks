@@ -77,6 +77,13 @@ public:
     METRIC_DEFINE_INT_GAUGE(load_mem_bytes, MetricUnit::BYTES);
     // Tablet meta memory usage
     METRIC_DEFINE_INT_GAUGE(tablet_meta_mem_bytes, MetricUnit::BYTES);
+
+    METRIC_DEFINE_INT_GAUGE(rowset_meta_mem_tracker, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(segment_meta_mem_tracker, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(segment_index_mem_tracker, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(column_reader_meta_mem_tracker, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(column_reader_index_mem_tracker, MetricUnit::BYTES);
+
     // Compaction memory usage
     METRIC_DEFINE_INT_GAUGE(compaction_mem_bytes, MetricUnit::BYTES);
     // SchemaChange memory usage
@@ -253,6 +260,13 @@ void SystemMetrics::_install_memory_metrics(MetricRegistry* registry) {
     registry->register_metric("query_mem_bytes", &_memory_metrics->query_mem_bytes);
     registry->register_metric("load_mem_bytes", &_memory_metrics->load_mem_bytes);
     registry->register_metric("tablet_meta_mem_bytes", &_memory_metrics->tablet_meta_mem_bytes);
+    
+    registry->register_metric("rowset_meta_mem_tracker", &_memory_metrics->rowset_meta_mem_tracker);
+    registry->register_metric("segment_meta_mem_tracker", &_memory_metrics->segment_meta_mem_tracker);
+    registry->register_metric("segment_index_mem_tracker", &_memory_metrics->segment_index_mem_tracker);
+    registry->register_metric("column_reader_meta_mem_tracker", &_memory_metrics->column_reader_meta_mem_tracker);
+    registry->register_metric("column_reader_index_mem_tracker", &_memory_metrics->column_reader_index_mem_tracker);
+
     registry->register_metric("compaction_mem_bytes", &_memory_metrics->compaction_mem_bytes);
     registry->register_metric("schema_change_mem_bytes", &_memory_metrics->schema_change_mem_bytes);
     registry->register_metric("column_pool_mem_bytes", &_memory_metrics->column_pool_mem_bytes);
@@ -319,6 +333,26 @@ void SystemMetrics::_update_memory_metrics() {
         _memory_metrics->tablet_meta_mem_bytes.set_value(
                 ExecEnv::GetInstance()->tablet_meta_mem_tracker()->consumption());
     }
+    if (ExecEnv::GetInstance()->rowset_meta_mem_tracker() != nullptr) {
+        _memory_metrics->rowset_meta_mem_tracker.set_value(
+                ExecEnv::GetInstance()->rowset_meta_mem_tracker()->consumption());
+    }
+    if (ExecEnv::GetInstance()->segment_meta_mem_tracker() != nullptr) {
+        _memory_metrics->segment_meta_mem_tracker.set_value(
+                ExecEnv::GetInstance()->segment_meta_mem_tracker()->consumption());
+    }
+    if (ExecEnv::GetInstance()->segment_index_mem_tracker() != nullptr) {
+        _memory_metrics->segment_index_mem_tracker.set_value(
+                ExecEnv::GetInstance()->segment_index_mem_tracker()->consumption());
+    }
+    if (ExecEnv::GetInstance()->column_reader_meta_mem_tracker() != nullptr) {
+        _memory_metrics->column_reader_meta_mem_tracker.set_value(
+                ExecEnv::GetInstance()->column_reader_meta_mem_tracker()->consumption());
+    }
+    if (ExecEnv::GetInstance()->column_reader_index_mem_tracker() != nullptr) {
+        _memory_metrics->column_reader_index_mem_tracker.set_value(
+                ExecEnv::GetInstance()->column_reader_index_mem_tracker()->consumption());
+    } 
     if (ExecEnv::GetInstance()->compaction_mem_tracker() != nullptr) {
         _memory_metrics->compaction_mem_bytes.set_value(
                 ExecEnv::GetInstance()->compaction_mem_tracker()->consumption());

@@ -85,9 +85,9 @@ public:
                                        const FooterPointerPB* partial_rowset_footer);
 
     Segment(const private_type&, std::shared_ptr<fs::BlockManager> blk_mgr, std::string fname, uint32_t segment_id,
-            const TabletSchema* tablet_schema);
+            const TabletSchema* tablet_schema, MemTracker* mem_tracker);
 
-    ~Segment() = default;
+    ~Segment();
 
     // Returns `EndOfFile` if |read_options| has predicate and no record in this segment
     // matched with the predicate.
@@ -95,8 +95,6 @@ public:
                                             const vectorized::SegmentReadOptions& read_options);
 
     uint64_t id() const { return _segment_id; }
-
-    uint32_t num_rows() const { return _num_rows; }
 
     // TODO: remove this method, create `ColumnIterator` via `ColumnReader`.
     Status new_column_iterator(uint32_t cid, ColumnIterator** iter);
@@ -129,8 +127,6 @@ public:
         return _sk_index_decoder->num_items() - 1;
     }
 
-    const std::string& file_name() const { return _fname; }
-
     size_t num_columns() const { return _column_readers.size(); }
 
     const ColumnReader* column(size_t i) const { return _column_readers[i].get(); }
@@ -142,6 +138,28 @@ public:
         }
         return size;
     }
+
+    int64_t meta_mem_usage() {
+        return sizeof(Segment);
+    }
+
+    int64_t index_mem_usage() {
+        int64_t size =  _sk_index_handle.mem_usage();
+        if (_sk_index_decoder != nullptr) {
+            size += _sk_index_decoder->mem_usage();
+        }
+        return size;
+    }
+
+    inline MemTracker* mem_tracker() { return _mem_tracker; }
+
+    inline fs::BlockManager* block_manager() { return _block_mgr.get();}
+
+    inline bool keep_in_memory() const { return _tablet_schema->is_in_memory(); }
+
+    inline const std::string& file_name() const { return _fname; }
+
+    inline uint32_t num_rows() const { return _num_rows; }
 
 private:
     Segment(const Segment&) = delete;
@@ -191,6 +209,7 @@ private:
     bool _needs_chunk_adapter = false;
     // When the storage types is different with TabletSchema
     bool _needs_block_adapter = false;
-};
 
+    MemTracker* _mem_tracker;
+};
 } // namespace starrocks

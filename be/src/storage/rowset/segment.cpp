@@ -65,9 +65,9 @@ StatusOr<std::shared_ptr<Segment>> Segment::open(MemTracker* mem_tracker, std::s
                                                  const std::string& filename, uint32_t segment_id,
                                                  const TabletSchema* tablet_schema, size_t* footer_length_hint,
                                                  const FooterPointerPB* partial_rowset_footer) {
-    auto segment = std::shared_ptr<Segment>(new Segment(private_type(0), blk_mgr, filename, segment_id, tablet_schema),
-                                            DeleterWithMemTracker<Segment>(mem_tracker));
+    auto segment = std::shared_ptr<Segment>(new Segment(private_type(0), blk_mgr, filename, segment_id, tablet_schema, mem_tracker));
     mem_tracker->consume(segment->mem_usage());
+    ExecEnv::GetInstance()->segment_meta_mem_tracker()->consume(segment->meta_mem_usage());
 
     RETURN_IF_ERROR(segment->_open(mem_tracker, footer_length_hint, partial_rowset_footer));
     return std::move(segment);
@@ -164,11 +164,19 @@ Status Segment::parse_segment_footer(fs::ReadableBlock* rblock, SegmentFooterPB*
 }
 
 Segment::Segment(const private_type&, std::shared_ptr<fs::BlockManager> blk_mgr, std::string fname, uint32_t segment_id,
-                 const TabletSchema* tablet_schema)
+                 const TabletSchema* tablet_schema, MemTracker* mem_tracker)
         : _block_mgr(std::move(blk_mgr)),
           _fname(std::move(fname)),
           _tablet_schema(tablet_schema),
-          _segment_id(segment_id) {}
+          _segment_id(segment_id),
+          _mem_tracker(mem_tracker) {}
+
+Segment::~Segment() {
+     _mem_tracker->release(mem_usage());
+    // tmp
+    ExecEnv::GetInstance()->segment_meta_mem_tracker()->release(meta_mem_usage());
+    ExecEnv::GetInstance()->segment_index_mem_tracker()->release(index_mem_usage());
+}
 
 Status Segment::_open(MemTracker* mem_tracker, size_t* footer_length_hint,
                       const FooterPointerPB* partial_rowset_footer) {
@@ -194,7 +202,7 @@ StatusOr<ChunkIteratorPtr> Segment::_new_iterator(const vectorized::Schema& sche
             continue;
         }
         if (!_column_readers[column_id]->segment_zone_map_filter(pair.second)) {
-            read_options.stats->segment_stats_filtered += _column_readers[column_id]->num_rows();
+            read_options.stats->segment_stats_filtered += _num_rows;
             return Status::EndOfFile(strings::Substitute("End of file $0, empty iterator", _fname));
         }
     }
@@ -244,6 +252,7 @@ Status Segment::_load_index(MemTracker* mem_tracker) {
         RETURN_IF_ERROR(PageIO::read_and_decompress_page(opts, &_sk_index_handle, &body, &footer));
 
         mem_tracker->consume(_sk_index_handle.mem_usage());
+        ExecEnv::GetInstance()->segment_index_mem_tracker()->consume(_sk_index_handle.mem_usage());
 
         DCHECK_EQ(footer.type(), SHORT_KEY_PAGE);
         DCHECK(footer.has_short_key_page_footer());
@@ -251,6 +260,7 @@ Status Segment::_load_index(MemTracker* mem_tracker) {
         _sk_index_decoder = std::make_unique<ShortKeyIndexDecoder>();
         Status st = _sk_index_decoder->parse(body, footer.short_key_page_footer());
         mem_tracker->consume(_sk_index_decoder->mem_usage());
+        ExecEnv::GetInstance()->segment_index_mem_tracker()->consume(_sk_index_decoder->mem_usage());
 
         return st;
     });
@@ -271,8 +281,7 @@ Status Segment::_create_column_readers(MemTracker* mem_tracker, SegmentFooterPB*
             continue;
         }
 
-        auto res = ColumnReader::create(mem_tracker, _block_mgr, footer->mutable_columns(iter->second), _fname,
-                                        footer->version(), _tablet_schema->is_in_memory());
+        auto res = ColumnReader::create(footer->mutable_columns(iter->second), this);
         if (!res.ok()) {
             return res.status();
         }

@@ -277,6 +277,11 @@ Status ExecEnv::init_mem_tracker() {
     _load_mem_tracker = new MemTracker(MemTracker::LOAD, load_mem_limit, "load", _mem_tracker);
     // Metadata statistics memory statistics do not use new mem statistics framework with hook
     _tablet_meta_mem_tracker = new MemTracker(-1, "tablet_meta", nullptr);
+    _rowset_meta_mem_tracker = new MemTracker(-1, "rowset_meta", nullptr);
+    _segment_meta_mem_tracker = new MemTracker(-1, "segment_meta", nullptr);
+    _segment_index_mem_tracker = new MemTracker(-1, "segment_index_meta", nullptr);
+    _column_reader_meta_mem_tracker = new MemTracker(-1, "column_reader_meta", nullptr);
+    _column_reader_index_mem_tracker = new MemTracker(-1, "column_reader_index_meta", nullptr);
 
     int64_t compaction_mem_limit = calc_max_compaction_memory(_mem_tracker->limit());
     _compaction_mem_tracker = new MemTracker(compaction_mem_limit, "compaction", _mem_tracker);
@@ -451,6 +456,29 @@ void ExecEnv::_destroy() {
     if (_tablet_meta_mem_tracker) {
         delete _tablet_meta_mem_tracker;
         _tablet_meta_mem_tracker = nullptr;
+    }
+    if (_rowset_meta_mem_tracker) {
+        delete _rowset_meta_mem_tracker;
+        _rowset_meta_mem_tracker = nullptr;
+    }
+
+    if (_segment_meta_mem_tracker) {
+        delete _segment_meta_mem_tracker;
+        _segment_meta_mem_tracker = nullptr;
+    }
+
+    if (_column_reader_meta_mem_tracker) {
+        delete _column_reader_meta_mem_tracker;
+        _column_reader_meta_mem_tracker = nullptr;
+    }
+    if (_segment_index_mem_tracker) {
+        delete _segment_index_mem_tracker;
+        _segment_index_mem_tracker = nullptr;
+    }
+
+    if (_column_reader_index_mem_tracker) {
+        delete _column_reader_index_mem_tracker;
+        _column_reader_index_mem_tracker = nullptr;
     }
     if (_load_mem_tracker) {
         delete _load_mem_tracker;

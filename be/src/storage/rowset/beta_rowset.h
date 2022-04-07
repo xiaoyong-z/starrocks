@@ -47,12 +47,15 @@ public:
                 std::shared_ptr<BetaRowset>(new BetaRowset(schema, std::move(rowset_path), std::move(rowset_meta)),
                                             DeleterWithMemTracker<BetaRowset>(mem_tracker));
         mem_tracker->consume(rowset->mem_usage());
+        ExecEnv::GetInstance()->rowset_meta_mem_tracker()->consume(rowset->mem_usage());
         return rowset;
     }
 
     BetaRowset(const TabletSchema* schema, std::string rowset_path, RowsetMetaSharedPtr rowset_meta);
 
-    ~BetaRowset() override {}
+    ~BetaRowset() override {
+        ExecEnv::GetInstance()->rowset_meta_mem_tracker()->release(mem_usage());
+    }
 
     // reload this rowset after the underlying segment file is changed
     Status reload();
