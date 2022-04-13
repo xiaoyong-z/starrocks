@@ -62,10 +62,10 @@ namespace starrocks {
 using strings::Substitute;
 
 StatusOr<std::shared_ptr<Segment>> Segment::open(MemTracker* mem_tracker, std::shared_ptr<fs::BlockManager> blk_mgr,
-                                                 const std::string& filename, uint32_t segment_id,
-                                                 const TabletSchema* tablet_schema, size_t* footer_length_hint,
+                                                 const std::string& filename, uint32_t segment_id, RowsetId rowset_id,
+                                                 const TabletSchema* tablet_schema, const ColumnReaderCache* column_reader_cache, size_t* footer_length_hint,
                                                  const FooterPointerPB* partial_rowset_footer) {
-    auto segment = std::shared_ptr<Segment>(new Segment(private_type(0), blk_mgr, filename, segment_id, tablet_schema, mem_tracker));
+    auto segment = std::shared_ptr<Segment>(new Segment(private_type(0), blk_mgr, filename, segment_id, rowset_id, tablet_schema, mem_tracker, column_reader_cache));
     mem_tracker->consume(segment->mem_usage());
     ExecEnv::GetInstance()->segment_meta_mem_tracker()->consume(segment->meta_mem_usage());
 
@@ -163,13 +163,15 @@ Status Segment::parse_segment_footer(fs::ReadableBlock* rblock, SegmentFooterPB*
     return Status::OK();
 }
 
-Segment::Segment(const private_type&, std::shared_ptr<fs::BlockManager> blk_mgr, std::string fname, uint32_t segment_id,
-                 const TabletSchema* tablet_schema, MemTracker* mem_tracker)
+Segment::Segment(const private_type&, std::shared_ptr<fs::BlockManager> blk_mgr, std::string fname, uint32_t segment_id, RowsetId rowset_id, 
+                 const TabletSchema* tablet_schema, MemTracker* mem_tracker, const ColumnReaderCache* column_reader_cache)
         : _block_mgr(std::move(blk_mgr)),
           _fname(std::move(fname)),
           _tablet_schema(tablet_schema),
           _segment_id(segment_id),
-          _mem_tracker(mem_tracker) {}
+          _mem_tracker(mem_tracker),
+          _column_reader_cache(column_reader_cache),
+          _needs_column_cache(column_reader_cache != nullptr) {}
 
 Segment::~Segment() {
      _mem_tracker->release(mem_usage());
@@ -273,19 +275,26 @@ Status Segment::_create_column_readers(MemTracker* mem_tracker, SegmentFooterPB*
         column_id_to_footer_ordinal.emplace(column_pb.unique_id(), ordinal);
     }
 
-    _column_readers.resize(_tablet_schema->columns().size());
+    if (LIKELY(_column_reader_cache == nullptr)) {
+        _column_readers.resize(_tablet_schema->columns().size());
+    }
     for (uint32_t ordinal = 0; ordinal < _tablet_schema->num_columns(); ++ordinal) {
         const auto& column = _tablet_schema->columns()[ordinal];
         auto iter = column_id_to_footer_ordinal.find(column.unique_id());
         if (iter == column_id_to_footer_ordinal.end()) {
+            if (UNLIKELY(_column_reader_cache != nullptr)) {
+                _nonexist_column_readers.push_back(ordinal);
+            }
             continue;
         }
 
-        auto res = ColumnReader::create(footer->mutable_columns(iter->second), this);
-        if (!res.ok()) {
-            return res.status();
+        if (LIKELY(_column_reader_cache == nullptr)) {
+            auto res = ColumnReader::create(footer->mutable_columns(iter->second), this);
+            if (!res.ok()) {
+                return res.status();
+            }
+            _column_readers[ordinal] = std::move(res).value();
         }
-        _column_readers[ordinal] = std::move(res).value();
     }
     return Status::OK();
 }
@@ -341,6 +350,68 @@ Status Segment::new_bitmap_index_iterator(uint32_t cid, BitmapIndexIterator** it
         return _column_readers[cid]->new_bitmap_index_iterator(iter);
     }
     return Status::OK();
+}
+
+// Status Segment::_create_column_readers(mem_tracker, &footer));
+
+Status Segment::_load_part_column_readers(SegmentFooterPB* footer, std::vector<ColumnReader*>& column_readers, const vector<uint32_t>& cids, const std::vector<uint32_t>& unload_indexes) {
+    std::unordered_map<uint32_t, uint32_t> column_id_to_footer_ordinal;
+    for (uint32_t ordinal = 0; ordinal < footer->columns().size(); ++ordinal) {
+        const auto& column_pb = footer->columns(ordinal);
+        column_id_to_footer_ordinal.emplace(column_pb.unique_id(), ordinal);
+    } 
+    for (uint32_t ordinal = 0; ordinal < _tablet_schema->num_columns(); ++ordinal) {
+        const auto& column = _tablet_schema->columns()[ordinal];
+        auto iter = column_id_to_footer_ordinal.find(column.unique_id());
+        if (iter == column_id_to_footer_ordinal.end()) {
+            if (UNLIKELY(_column_reader_cache != nullptr)) {
+                _nonexist_column_readers.push_back(ordinal);
+            }
+            continue;
+        }
+
+        if (LIKELY(_column_reader_cache == nullptr)) {
+            auto res = ColumnReader::create(footer->mutable_columns(iter->second), this);
+            if (!res.ok()) {
+                return res.status();
+            }
+            _column_readers[ordinal] = std::move(res).value();
+        }
+    }
+    return Status::OK();
+}
+
+Status Segment::load_column_reader(vector<uint32_t> cids, std::vector<ColumnReader*>& column_readers) {
+    // Ensure column reader cache is enabled
+    DCHECK(_column_reader_cache != nullptr);
+    column_readers.reserve(cids.size());
+    std::vector<CacheKey> cache_keys;
+    cache_keys.reserve(cids.size());
+    std::string prefix = this->_rowset_id.to_string() + std::to_string(this->_segment_id);
+    std::for_each(cids.begin(), cids.end(), [&prefix, &cache_keys](uint32_t cid) {
+        cache_keys.emplace_back(prefix + std::to_string(cid));
+    });
+
+    for (auto it = _nonexist_column_readers.begin(); it != _nonexist_column_readers.end(); it++) {
+        auto cid_it = std::find(cids.begin(), cids.end(), *it);
+        if (cid_it != cids.end()) {
+            cache_keys[*cid_it] = "";
+        }
+    }
+    std::vector<uint32_t> unload_indexes;
+    if (_column_reader_cache->look_up_column_readers(cache_keys, column_readers, unload_indexes)) {
+        // all column readers are in the cache
+        return Status::OK();
+    }
+    
+    // Some column readers are not in the cache, their indexs are saved in unload_indexes
+    SegmentFooterPB footer;
+    std::unique_ptr<fs::ReadableBlock> rblock;
+    RETURN_IF_ERROR(_block_mgr->open_block(_fname, &rblock));
+    RETURN_IF_ERROR(Segment::parse_segment_footer(rblock.get(), &footer, footer_length_hint, partial_rowset_footer));
+    RETURN_IF_ERROR(_create_column_readers(mem_tracker, &footer));
+
+    return column_readers;
 }
 
 } // namespace starrocks

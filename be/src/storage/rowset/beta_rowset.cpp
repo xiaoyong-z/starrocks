@@ -61,8 +61,8 @@ std::string BetaRowset::segment_srcrssid_file_path(const std::string& dir, const
     return strings::Substitute("$0/$1_$2.rssid", dir, rowset_id.to_string(), segment_id);
 }
 
-BetaRowset::BetaRowset(const TabletSchema* schema, string rowset_path, RowsetMetaSharedPtr rowset_meta)
-        : Rowset(schema, std::move(rowset_path), std::move(rowset_meta)) {}
+BetaRowset::BetaRowset(const TabletSchema* schema, string rowset_path, RowsetMetaSharedPtr rowset_meta, const ColumnReaderCache* column_reader_cache)
+        : Rowset(schema, std::move(rowset_path), std::move(rowset_meta)), _column_reader_cache(column_reader_cache) {}
 
 Status BetaRowset::init() {
     return Status::OK();
@@ -76,8 +76,8 @@ Status BetaRowset::do_load() {
     size_t footer_size_hint = 16 * 1024;
     for (int seg_id = 0; seg_id < num_segments(); ++seg_id) {
         std::string seg_path = segment_file_path(_rowset_path, rowset_id(), seg_id);
-        auto res = Segment::open(ExecEnv::GetInstance()->tablet_meta_mem_tracker(), block_mgr, seg_path, seg_id,
-                                 _schema, &footer_size_hint, rowset_meta()->partial_rowset_footer(seg_id));
+        auto res = Segment::open(ExecEnv::GetInstance()->tablet_meta_mem_tracker(), block_mgr, seg_path, seg_id, rowset_id(),
+                                 _schema, _column_reader_cache, &footer_size_hint, rowset_meta()->partial_rowset_footer(seg_id));
         if (!res.ok()) {
             LOG(WARNING) << "Fail to open " << seg_path << ": " << res.status();
             _segments.clear();
@@ -351,8 +351,8 @@ Status BetaRowset::reload() {
     for (int seg_id = 0; seg_id < num_segments(); ++seg_id) {
         std::string seg_path = segment_file_path(_rowset_path, rowset_id(), seg_id);
         block_mgr->erase_block_cache(seg_path);
-        auto res = Segment::open(ExecEnv::GetInstance()->tablet_meta_mem_tracker(), block_mgr, seg_path, seg_id,
-                                 _schema, &footer_size_hint);
+        auto res = Segment::open(ExecEnv::GetInstance()->tablet_meta_mem_tracker(), block_mgr, seg_path, seg_id, rowset_id(),
+                                 _schema, _column_reader_cache, &footer_size_hint);
         if (!res.ok()) {
             LOG(WARNING) << "Fail to open " << seg_path << ": " << res.status();
             _segments.clear();

@@ -35,6 +35,7 @@
 #include "gen_cpp/MasterService_types.h"
 #include "gen_cpp/olap_file.pb.h"
 #include "storage/base_tablet.h"
+#include "storage/rowset/column_reader_cache.h"
 #include "storage/data_dir.h"
 #include "storage/olap_define.h"
 #include "storage/rowset/rowset.h"
@@ -355,6 +356,11 @@ private:
     std::atomic<int64_t> _cumulative_point{0};
     std::atomic<int32_t> _newly_created_rowset_num{0};
     std::atomic<int64_t> _last_checkpoint_time{0};
+
+    // For tablet with a large number of columns (default 100 columns), 
+    // it will enable column reader cache, only part of the column readers
+    // will be loaded into the memory
+    std::unique_ptr<ColumnReaderCache> _column_reader_cache;
 
     Tablet(const Tablet&) = delete;
     const Tablet& operator=(const Tablet&) = delete;

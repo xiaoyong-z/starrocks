@@ -33,6 +33,7 @@
 #include "storage/fs/block_manager.h"
 #include "storage/rowset/page_handle.h"
 #include "storage/rowset/page_pointer.h"
+#include "storage/rowset/column_reader_cache.h"
 #include "storage/short_key_index.h"
 #include "storage/tablet_schema.h"
 #include "util/faststring.h"
@@ -76,16 +77,18 @@ class Segment : public std::enable_shared_from_this<Segment> {
 
 public:
     static StatusOr<std::shared_ptr<Segment>> open(MemTracker* mem_tracker, std::shared_ptr<fs::BlockManager> blk_mgr,
-                                                   const std::string& filename, uint32_t segment_id,
+                                                   const std::string& filename, uint32_t segment_id, RowsetId rowset_id,
                                                    const TabletSchema* tablet_schema,
+                                                   const ColumnReaderCache* column_reader_cache,
                                                    size_t* footer_length_hint = nullptr,
-                                                   const FooterPointerPB* partial_rowset_footer = nullptr);
+                                                   const FooterPointerPB* partial_rowset_footer = nullptr
+                                                   );
 
     static Status parse_segment_footer(fs::ReadableBlock* rblock, SegmentFooterPB* footer, size_t* footer_length_hint,
                                        const FooterPointerPB* partial_rowset_footer);
 
-    Segment(const private_type&, std::shared_ptr<fs::BlockManager> blk_mgr, std::string fname, uint32_t segment_id,
-            const TabletSchema* tablet_schema, MemTracker* mem_tracker);
+    Segment(const private_type&, std::shared_ptr<fs::BlockManager> blk_mgr, std::string fname, uint32_t segment_id, RowsetId rowset_id,
+            const TabletSchema* tablet_schema, MemTracker* mem_tracker, const ColumnReaderCache* column_reader_cache);
 
     ~Segment();
 
@@ -139,6 +142,8 @@ public:
         return size;
     }
 
+    Status Segment::load_column_reader(vector<uint32_t> cids, std::vector<ColumnReader*>& column_readers);
+
     int64_t meta_mem_usage() {
         return sizeof(Segment);
     }
@@ -179,6 +184,8 @@ private:
     StatusOr<ChunkIteratorPtr> _new_iterator(const vectorized::Schema& schema,
                                              const vectorized::SegmentReadOptions& read_options);
 
+    Status _load_part_column_readers(SegmentFooterPB* footer, const vector<uint32_t>& cids, const std::vector<uint32_t>& unload_indexes);
+
     void _prepare_adapter_info();
 
     friend class SegmentIterator;
@@ -210,6 +217,11 @@ private:
     // When the storage types is different with TabletSchema
     bool _needs_block_adapter = false;
 
-    MemTracker* _mem_tracker;
+    MemTracker* _mem_tracker = nullptr;
+
+    // used for column reader cache
+    std::vector<uint32_t> _nonexist_column_readers;
+    ColumnReaderCache* _column_reader_cache = nullptr;
+    RowsetId _rowset_id;
 };
 } // namespace starrocks

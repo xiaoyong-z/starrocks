@@ -27,6 +27,7 @@
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/rowset/segment.h"
+#include "storage/rowset/column_reader_cache.h"
 
 namespace starrocks {
 
@@ -42,16 +43,17 @@ class KVStore;
 class BetaRowset : public Rowset {
 public:
     static std::shared_ptr<BetaRowset> create(MemTracker* mem_tracker, const TabletSchema* schema,
-                                              std::string rowset_path, RowsetMetaSharedPtr rowset_meta) {
+                                              std::string rowset_path, RowsetMetaSharedPtr rowset_meta,
+                                              const ColumnReaderCache* column_reader_cache) {
         auto rowset =
-                std::shared_ptr<BetaRowset>(new BetaRowset(schema, std::move(rowset_path), std::move(rowset_meta)),
+                std::shared_ptr<BetaRowset>(new BetaRowset(schema, std::move(rowset_path), std::move(rowset_meta), column_reader_cache),
                                             DeleterWithMemTracker<BetaRowset>(mem_tracker));
         mem_tracker->consume(rowset->mem_usage());
         ExecEnv::GetInstance()->rowset_meta_mem_tracker()->consume(rowset->mem_usage());
         return rowset;
     }
 
-    BetaRowset(const TabletSchema* schema, std::string rowset_path, RowsetMetaSharedPtr rowset_meta);
+    BetaRowset(const TabletSchema* schema, std::string rowset_path, RowsetMetaSharedPtr rowset_meta, const ColumnReaderCache* column_reader_cache);
 
     ~BetaRowset() override {
         ExecEnv::GetInstance()->rowset_meta_mem_tracker()->release(mem_usage());
@@ -118,6 +120,7 @@ private:
     friend class RowsetFactory;
     friend class BetaRowsetReader;
     std::vector<SegmentSharedPtr> _segments;
+    const ColumnReaderCache* _column_reader_cache = nullptr;
 };
 
 } // namespace starrocks
