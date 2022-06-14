@@ -19,17 +19,43 @@ namespace vectorized {
 
 class MemTableSink;
 
+class MemTableFlushContext {
+public:
+    void init(std::unique_ptr<Column> deletes, ChunkPtr result_chunk, MemTableSink* sink, MemTracker* mem_tracker) {
+        _deletes = std::move(deletes);
+        _result_chunk = std::move(result_chunk);
+        _sink = sink;
+        _mem_tracker = mem_tracker;
+    }
+
+    Status flush();
+    size_t memory_usage() const;
+    MemTracker* mem_tracker() { return _mem_tracker; }
+
+private:
+    std::unique_ptr<Column> _deletes;
+    ChunkPtr _result_chunk;
+    MemTableSink* _sink;
+    MemTracker* _mem_tracker;
+};
+
 class MemTable {
 public:
-    MemTable(int64_t tablet_id, const TabletSchema* tablet_schema, const std::vector<SlotDescriptor*>* slot_descs,
-             MemTableSink* sink, MemTracker* mem_tracker);
-
-    MemTable(int64_t tablet_id, const Schema& schema, MemTableSink* sink, int64_t max_buffer_size,
+    MemTable(int64_t tablet_id, Schema* schema, const std::vector<SlotDescriptor*>* slot_descs, MemTableSink* sink,
              MemTracker* mem_tracker);
+
+    MemTable(int64_t tablet_id, Schema* schema, MemTableSink* sink, int64_t max_buffer_size, MemTracker* mem_tracker);
+
+    MemTable(int64_t memtable_id, int64_t tablet_id, Schema* schema, const std::vector<SlotDescriptor*>* slot_descs,
+             MemTableSink* sink, MemTracker* mem_tracker);
 
     ~MemTable();
 
     int64_t tablet_id() const { return _tablet_id; }
+
+    int64_t memtable_id() const { return _memtable_id; }
+
+    bool has_op_slot() const { return _has_op_slot; }
 
     // the total memory used (contain tmp chunk and aggregator chunk)
     size_t memory_usage() const;
@@ -45,7 +71,14 @@ public:
 
     Status finalize();
 
+    Status reuse_finalize(MemTableFlushContext* flush_context);
+
     bool is_full() const;
+
+    void reset();
+
+    void reallocate(int64_t tablet_id, const std::vector<SlotDescriptor*>* slot_descs, MemTableSink* sink,
+                    MemTracker* mem_tracker);
 
 private:
     void _merge();
@@ -58,6 +91,8 @@ private:
     void _init_aggregator_if_needed();
     void _aggregate(bool is_final);
 
+    void clear_unfinalized_data();
+
     Status _split_upserts_deletes(ChunkPtr& src, ChunkPtr* upserts, std::unique_ptr<Column>* deletes);
 
     ChunkPtr _chunk;
@@ -69,7 +104,7 @@ private:
     std::vector<uint32_t> _selective_values;
 
     int64_t _tablet_id;
-    Schema _vectorized_schema;
+    Schema* _vectorized_schema;
     const TabletSchema* _tablet_schema;
     // the slot in _slot_descs are in order of tablet's schema
     const std::vector<SlotDescriptor*>* _slot_descs;
@@ -95,6 +130,10 @@ private:
     size_t _chunk_bytes_usage = 0;
     size_t _aggregator_memory_usage = 0;
     size_t _aggregator_bytes_usage = 0;
+
+    int64_t _memtable_id;
+    bool _reuse;
+    bool _finalized;
 };
 
 } // namespace vectorized

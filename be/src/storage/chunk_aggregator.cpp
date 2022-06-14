@@ -196,6 +196,45 @@ void ChunkAggregator::aggregate_reset() {
     _bytes_usage_num_rows = 0;
 }
 
+void ChunkAggregator::swap_aggregate_result(const ChunkPtr& chunk) {
+    for (int i = 0; i < _num_fields; ++i) {
+        _column_aggregator[i]->finalize();
+    }
+    DCHECK(chunk->is_empty());
+    chunk->swap_chunk(*_aggregate_chunk);
+    _aggregate_rows = 0;
+
+    for (int i = 0; i < _num_fields; ++i) {
+        auto p = _aggregate_chunk->get_column_by_index(i).get();
+        _column_aggregator[i]->update_aggregate(p);
+    }
+    _has_aggregate = false;
+
+    _element_memory_usage = 0;
+    _element_memory_usage_num_rows = 0;
+    _bytes_usage = 0;
+    _bytes_usage_num_rows = 0;
+}
+
+void ChunkAggregator::reset() {
+    DCHECK(_aggregate_chunk->is_empty());
+    _element_memory_usage = 0;
+    _element_memory_usage_num_rows = 0;
+    _bytes_usage = 0;
+    _bytes_usage_num_rows = 0;
+    _source_row = 0;
+    _source_size = 0;
+    _is_eq.clear();
+    _selective_index.clear();
+    _aggregate_loops.clear();
+    _aggregate_rows = 0;
+    _do_aggregate = true;
+    _has_aggregate = false;
+    _merged_rows = 0;
+    _is_vertical_merge = false;
+    _is_key = false;
+}
+
 ChunkPtr ChunkAggregator::aggregate_result() {
     for (int i = 0; i < _num_fields; ++i) {
         _column_aggregator[i]->finalize();

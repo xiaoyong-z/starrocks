@@ -18,6 +18,7 @@
 #include "storage/storage_engine.h"
 
 namespace starrocks::lake {
+static const string LOAD_OP_COLUMN = "__op";
 
 using Chunk = starrocks::vectorized::Chunk;
 using Column = starrocks::vectorized::Column;
@@ -55,7 +56,8 @@ public:
               _txn_id(txn_id),
               _partition_id(partition_id),
               _slots(slots),
-              _mem_tracker(mem_tracker) {}
+              _mem_tracker(mem_tracker),
+              _schema_initialized(false) {}
 
     ~DeltaWriterImpl() = default;
 
@@ -95,10 +97,23 @@ private:
     std::unique_ptr<MemTableSink> _mem_table_sink;
     std::unique_ptr<FlushToken> _flush_token;
     std::shared_ptr<const TabletSchema> _tablet_schema;
+    vectorized::Schema _vectorized_schema;
+    bool _schema_initialized;
 };
 
 inline void DeltaWriterImpl::reset_memtable() {
-    _mem_table.reset(new MemTable(_tablet_id, _tablet_schema.get(), _slots, _mem_table_sink.get(), _mem_tracker));
+    if (_schema_initialized == false) {
+        _vectorized_schema = std::move(vectorized::ChunkHelper::convert_schema_to_format_v2(*_tablet_schema));
+        if (_tablet_schema->keys_type() == KeysType::PRIMARY_KEYS && _slots->back()->col_name() == LOAD_OP_COLUMN) {
+            // load slots have __op field, so add to _vectorized_schema
+            auto op_column = std::make_shared<starrocks::vectorized::Field>((ColumnId)-1, LOAD_OP_COLUMN,
+                                                                            FieldType::OLAP_FIELD_TYPE_TINYINT, false);
+            op_column->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
+            _vectorized_schema.append(op_column);
+        }
+        _schema_initialized = true;
+    }
+    _mem_table.reset(new MemTable(_tablet_id, &_vectorized_schema, _slots, _mem_table_sink.get(), _mem_tracker));
 }
 
 inline Status DeltaWriterImpl::flush_async() {

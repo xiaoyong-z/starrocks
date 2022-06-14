@@ -92,7 +92,7 @@ StorageEngine::StorageEngine(const EngineOptions& options)
           _rowset_id_generator(new UniqueRowsetIdGenerator(options.backend_uid)),
           _memtable_flush_executor(nullptr),
           _update_manager(new UpdateManager(options.update_mem_tracker)),
-          _compaction_manager(new CompactionManager()) {
+          _memtable_manager(new vectorized::MemTableManager()) {
     if (_s_instance == nullptr) {
         _s_instance = this;
     }

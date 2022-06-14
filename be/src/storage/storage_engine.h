@@ -43,6 +43,7 @@
 #include "runtime/heartbeat_flags.h"
 #include "storage/cluster_id_mgr.h"
 #include "storage/kv_store.h"
+#include "storage/memtable_manager.h"
 #include "storage/olap_common.h"
 #include "storage/olap_define.h"
 #include "storage/options.h"
@@ -61,6 +62,7 @@ class MemTableFlushExecutor;
 class Tablet;
 class UpdateManager;
 class CompactionManager;
+class MemTableManager;
 
 // StorageEngine singleton to manage all Table pointers.
 // Providing add/drop/get operations.
@@ -162,6 +164,8 @@ public:
 
     UpdateManager* update_manager() { return _update_manager.get(); }
 
+    vectorized::MemTableManager* memtable_manager() { return _memtable_manager.get(); }
+
     bool check_rowset_id_in_unused_rowsets(const RowsetId& rowset_id);
 
     RowsetId next_rowset_id() { return _rowset_id_generator->next_id(); };
@@ -231,6 +235,9 @@ private:
     // delete tablet with io error process function
     void* _disk_stat_monitor_thread_callback(void* arg);
 
+    // recycle memtable not used for a period of time
+    void* _memtable_pool_gc_thread_callback(void* arg);
+
     // clean file descriptors cache
     void* _fd_cache_clean_callback(void* arg);
 
@@ -293,6 +300,8 @@ private:
     std::thread _garbage_sweeper_thread;
     // thread to monitor disk stat
     std::thread _disk_stat_monitor_thread;
+    // thread to recycle memtable
+    std::thread _memtable_pool_gc_thread;
     // threads to run base compaction
     std::vector<std::thread> _base_compaction_threads;
     // threads to check cumulative
@@ -333,6 +342,7 @@ private:
     std::unique_ptr<UpdateManager> _update_manager;
 
     std::unique_ptr<CompactionManager> _compaction_manager;
+    std::unique_ptr<vectorized::MemTableManager> _memtable_manager;
 
     HeartbeatFlags* _heartbeat_flags = nullptr;
 

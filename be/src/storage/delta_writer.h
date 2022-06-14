@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "column/chunk.h"
 #include "column/vectorized_fwd.h"
 #include "gen_cpp/internal_service.pb.h"
 #include "gutil/macros.h"
@@ -25,6 +26,7 @@ class MemTableSink;
 enum WriteType { LOAD = 1, LOAD_DELETE = 2, DELETE = 3 };
 
 struct DeltaWriterOptions {
+    int64_t index_id;
     int64_t tablet_id;
     int32_t schema_hash;
     WriteType write_type;
@@ -123,7 +125,9 @@ private:
     TabletSharedPtr _tablet;
     RowsetSharedPtr _cur_rowset;
     std::unique_ptr<RowsetWriter> _rowset_writer;
-    std::unique_ptr<MemTable> _mem_table;
+    bool _schema_initialized;
+    Schema _vectorized_schema;
+    MemTable* _mem_table;
     std::unique_ptr<MemTableSink> _mem_table_sink;
     const TabletSchema* _tablet_schema;
 

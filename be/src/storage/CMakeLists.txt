@@ -164,4 +164,5 @@ add_library(Storage STATIC
     lake/starlet_group_assigner.cpp
     lake/tablet.cpp
     lake/tablet_manager.cpp
+    memtable_manager.cpp
 )

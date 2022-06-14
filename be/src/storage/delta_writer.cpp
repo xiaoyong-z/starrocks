@@ -32,6 +32,7 @@ DeltaWriter::DeltaWriter(const DeltaWriterOptions& opt, MemTracker* mem_tracker,
           _tablet(nullptr),
           _cur_rowset(nullptr),
           _rowset_writer(nullptr),
+          _schema_initialized(false),
           _mem_table(nullptr),
           _mem_table_sink(nullptr),
           _tablet_schema(nullptr),
@@ -50,7 +51,18 @@ DeltaWriter::~DeltaWriter() {
         _garbage_collection();
         break;
     }
-    _mem_table.reset();
+    if (config::enable_memtable_pool) {
+        if (_mem_table != nullptr) {
+            LOG(WARNING) << "free memtable" << _mem_table->memtable_id();
+            StorageEngine::instance()->memtable_manager()->free_memtable(_opt.index_id, _mem_table);
+            _mem_table = nullptr;
+        }
+    } else {
+        if (_mem_table != nullptr) {
+            delete _mem_table;
+            _mem_table = nullptr;
+        }
+    }
     _mem_table_sink.reset();
     _rowset_writer.reset();
     _cur_rowset.reset();
@@ -247,6 +259,17 @@ Status DeltaWriter::close() {
         _set_state(st.ok() ? kClosed : kAborted);
         return st;
     }
+    if (config::enable_memtable_pool) {
+        if (_mem_table != nullptr) {
+            StorageEngine::instance()->memtable_manager()->free_memtable(_opt.index_id, _mem_table);
+            _mem_table = nullptr;
+        }
+    } else {
+        if (_mem_table != nullptr) {
+            delete _mem_table;
+            _mem_table = nullptr;
+        }
+    }
     return Status::OK();
 }
 
@@ -255,8 +278,16 @@ Status DeltaWriter::_flush_memtable_async() {
     if (_mem_table == nullptr) {
         return Status::OK();
     }
-    RETURN_IF_ERROR(_mem_table->finalize());
-    return _flush_token->submit(std::move(_mem_table));
+    if (config::enable_memtable_pool) {
+        std::unique_ptr<MemTableFlushContext> memtable_flush_context = std::make_unique<MemTableFlushContext>();
+        RETURN_IF_ERROR(_mem_table->reuse_finalize(memtable_flush_context.get()));
+        return _flush_token->submit(std::move(memtable_flush_context));
+    } else {
+        RETURN_IF_ERROR(_mem_table->finalize());
+        std::unique_ptr<MemTable> mem_table(_mem_table);
+        _mem_table = nullptr;
+        return _flush_token->submit(std::move(mem_table));
+    }
 }
 
 Status DeltaWriter::_flush_memtable() {
@@ -265,8 +296,30 @@ Status DeltaWriter::_flush_memtable() {
 }
 
 void DeltaWriter::_reset_mem_table() {
-    _mem_table = std::make_unique<MemTable>(_tablet->tablet_id(), _tablet_schema, _opt.slots, _mem_table_sink.get(),
-                                            _mem_tracker);
+    if (config::enable_memtable_pool) {
+        if (_mem_table == nullptr) {
+            _mem_table = StorageEngine::instance()->memtable_manager()->allocate_memtable(
+                    _opt.index_id, _tablet->tablet_id(), _tablet_schema, _opt.slots, _mem_table_sink.get(),
+                    _mem_tracker);
+        } else {
+            _mem_table->reset();
+        }
+    } else {
+        if (_schema_initialized == false) {
+            _vectorized_schema = std::move(ChunkHelper::convert_schema_to_format_v2(*_tablet_schema));
+            if (_tablet_schema->keys_type() == KeysType::PRIMARY_KEYS &&
+                _opt.slots->back()->col_name() == LOAD_OP_COLUMN) {
+                // load slots have __op field, so add to _vectorized_schema
+                auto op_column = std::make_shared<starrocks::vectorized::Field>(
+                        (ColumnId)-1, LOAD_OP_COLUMN, FieldType::OLAP_FIELD_TYPE_TINYINT, false);
+                op_column->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
+                _vectorized_schema.append(op_column);
+            }
+            _schema_initialized = true;
+        }
+        _mem_table = new MemTable(_tablet->tablet_id(), &_vectorized_schema, _opt.slots, _mem_table_sink.get(),
+                                  _mem_tracker);
+    }
 }
 
 Status DeltaWriter::commit() {

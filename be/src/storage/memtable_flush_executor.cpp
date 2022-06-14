@@ -30,22 +30,39 @@ namespace starrocks {
 
 class MemtableFlushTask final : public Runnable {
 public:
+    MemtableFlushTask(FlushToken* flush_token, std::unique_ptr<vectorized::MemTableFlushContext> memtable_flush_context)
+            : _flush_token(flush_token),
+              _memtable_flush_context(std::move(memtable_flush_context)),
+              _memtable(nullptr) {}
+
     MemtableFlushTask(FlushToken* flush_token, std::unique_ptr<vectorized::MemTable> memtable)
-            : _flush_token(flush_token), _memtable(std::move(memtable)) {}
+            : _flush_token(flush_token), _memtable_flush_context(nullptr), _memtable(std::move(memtable)) {}
 
     ~MemtableFlushTask() = default;
 
     void run() override {
-        SCOPED_THREAD_LOCAL_MEM_SETTER(_memtable->mem_tracker(), false);
+        if (_memtable_flush_context != nullptr) {
+            DCHECK(_memtable == nullptr);
+            SCOPED_THREAD_LOCAL_MEM_SETTER(_memtable_flush_context->mem_tracker(), false);
 
-        _flush_token->_stats.cur_flush_count++;
-        _flush_token->_flush_memtable(_memtable.get());
-        _flush_token->_stats.cur_flush_count--;
-        _memtable.reset();
+            _flush_token->_stats.cur_flush_count++;
+            _flush_token->_flush_memtable_context(_memtable_flush_context.get());
+            _flush_token->_stats.cur_flush_count--;
+            _memtable_flush_context.reset();
+        } else {
+            DCHECK(_memtable_flush_context == nullptr);
+            SCOPED_THREAD_LOCAL_MEM_SETTER(_memtable->mem_tracker(), false);
+
+            _flush_token->_stats.cur_flush_count++;
+            _flush_token->_flush_memtable(_memtable.get());
+            _flush_token->_stats.cur_flush_count--;
+            _memtable.reset();
+        }
     }
 
 private:
     FlushToken* _flush_token;
+    std::unique_ptr<vectorized::MemTableFlushContext> _memtable_flush_context;
     std::unique_ptr<vectorized::MemTable> _memtable;
 };
 
@@ -53,6 +70,14 @@ std::ostream& operator<<(std::ostream& os, const FlushStatistic& stat) {
     os << "(flush time(ms)=" << stat.flush_time_ns / 1000 / 1000 << ", flush count=" << stat.flush_count << ")"
        << ", flush flush_size_bytes = " << stat.flush_size_bytes;
     return os;
+}
+
+Status FlushToken::submit(std::unique_ptr<vectorized::MemTableFlushContext> memtable_flush_context) {
+    RETURN_IF_ERROR(status());
+    // Does not acount the size of MemtableFlushTask into any memory tracker
+    SCOPED_THREAD_LOCAL_MEM_SETTER(nullptr, false);
+    auto task = std::make_shared<MemtableFlushTask>(this, std::move(memtable_flush_context));
+    return _flush_token->submit(std::move(task));
 }
 
 Status FlushToken::submit(std::unique_ptr<vectorized::MemTable> memtable) {
@@ -71,6 +96,18 @@ Status FlushToken::wait() {
     _flush_token->wait();
     std::lock_guard l(_status_lock);
     return _status;
+}
+
+void FlushToken::_flush_memtable_context(vectorized::MemTableFlushContext* memtable_flush_context) {
+    // If previous flush has failed, return directly
+    if (!status().ok()) return;
+
+    MonotonicStopWatch timer;
+    timer.start();
+    set_status(memtable_flush_context->flush());
+    _stats.flush_time_ns += timer.elapsed_time();
+    _stats.flush_count++;
+    _stats.flush_size_bytes += memtable_flush_context->memory_usage();
 }
 
 void FlushToken::_flush_memtable(vectorized::MemTable* memtable) {

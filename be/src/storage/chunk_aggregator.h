@@ -43,6 +43,14 @@ public:
 
     bool has_aggregate_data() const { return _has_aggregate; }
 
+    void swap_aggregate_result(const ChunkPtr& chunk);
+
+    void reset();
+
+    bool check_empty() const { return _aggregate_chunk->is_empty(); }
+
+    void reset_chunk() { _aggregate_chunk->reset(); }
+
     bool is_finish();
 
     void aggregate_reset();

@@ -76,6 +76,13 @@ Status StorageEngine::start_bg_threads() {
     Thread::set_thread_name(_disk_stat_monitor_thread, "disk_monitor");
     LOG(INFO) << "disk stat monitor thread started";
 
+    if (config::enable_memtable_pool) {
+        // start thread for monitoring the tablet with io error
+        _memtable_pool_gc_thread = std::thread([this] { _memtable_pool_gc_thread_callback(nullptr); });
+        Thread::set_thread_name(_memtable_pool_gc_thread, "memtable_pool_gc_thread");
+        LOG(INFO) << "memtable pool gc thread started";
+    }
+
     // convert store map to vector
     std::vector<DataDir*> data_dirs;
     for (auto& tmp_store : _store_map) {
@@ -310,6 +317,24 @@ void* StorageEngine::_disk_stat_monitor_thread_callback(void* arg) {
         int32_t interval = config::disk_stat_monitor_interval;
         if (interval <= 0) {
             LOG(WARNING) << "disk_stat_monitor_interval config is illegal: " << interval << ", force set to 1";
+            interval = 1;
+        }
+        SLEEP_IN_BG_WORKER(interval);
+    }
+
+    return nullptr;
+}
+
+void* StorageEngine::_memtable_pool_gc_thread_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        memtable_manager()->garbage_collection();
+
+        int32_t interval = config::memtable_pool_gc_check_interval_sec;
+        if (interval <= 0) {
+            LOG(WARNING) << "memtable gc config is illegal: " << interval << ", force set to 1";
             interval = 1;
         }
         SLEEP_IN_BG_WORKER(interval);
