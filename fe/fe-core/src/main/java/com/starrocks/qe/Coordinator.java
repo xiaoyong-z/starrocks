@@ -43,6 +43,8 @@ import com.google.common.collect.Sets;
 import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.authentication.AuthenticationManager;
 import com.starrocks.catalog.FsBroker;
+import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.MarkedCountDownLatch;
 import com.starrocks.common.Pair;
 import com.starrocks.common.Status;
@@ -256,6 +258,40 @@ public class Coordinator {
 
         this.coordinatorPreprocessor =
                 new CoordinatorPreprocessor(queryId, context, fragments, scanNodes, this.descTable, queryGlobals,
+                        queryOptions);
+    }
+
+    // Used for routine load with tablet sink dop > 1
+    public Coordinator(Long jobId, TUniqueId queryId, OlapTable destTable, DescriptorTable descTable,
+                       List<PlanFragment> fragments, List<ScanNode> scanNodes, String timezone, long startTime,
+                       int timeout, TCompressionType compressionType,
+                       int parallelRequestNumber, long execMemLimit, long loadMemLimit) {
+        this.isBlockQuery = true;
+        this.jobId = jobId;
+        this.queryId = queryId;
+        this.connectContext = new ConnectContext();
+        this.connectContext.sessionVariable.setEnablePipelineEngine(false);
+        this.descTable = descTable.toThrift();
+        this.fragments = fragments;
+        this.scanNodes = scanNodes;
+        this.queryOptions = new TQueryOptions();
+        this.queryGlobals = CoordinatorPreprocessor.genQueryGlobals(startTime, timezone);
+        this.needReport = false;
+        this.queryOptions.setQuery_type(TQueryType.LOAD);
+        this.queryOptions.setQuery_timeout(timeout);
+        this.queryOptions.setLoad_transmission_compression_type(compressionType);
+        if (parallelRequestNumber != 0 && !destTable.isLakeTable()) {
+            if (destTable.getKeysType() == KeysType.DUP_KEYS) {
+                this.queryOptions.setLoad_dop(parallelRequestNumber);
+            } else {
+                this.queryOptions.setLoad_dop(1);
+            }
+        }
+        // for stream load, we use exec_mem_limit to limit the memory usage of load channel.
+        this.queryOptions.setMem_limit(execMemLimit);
+        this.queryOptions.setLoad_mem_limit(loadMemLimit);
+        this.coordinatorPreprocessor =
+                new CoordinatorPreprocessor(queryId, this.connectContext, fragments, scanNodes, this.descTable, queryGlobals,
                         queryOptions);
     }
 

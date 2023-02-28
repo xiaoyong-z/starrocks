@@ -34,11 +34,21 @@
 
 package com.starrocks.planner;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.DescriptorTable;
+import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.common.util.DebugUtil;
+import com.starrocks.proto.PExecPlanFragmentResult;
+import com.starrocks.proto.PPlanFragmentCancelReason;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.Coordinator;
+import com.starrocks.qe.CoordinatorPreprocessor;
+import com.starrocks.qe.SimpleScheduler;
+import com.starrocks.rpc.RpcException;
 import com.starrocks.sql.ast.PartitionNames;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.TupleDescriptor;
@@ -61,7 +71,10 @@ import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
 import com.starrocks.sql.optimizer.statistics.IDictManager;
 import com.starrocks.thrift.InternalServiceVersion;
+import com.starrocks.thrift.TDescriptorTable;
 import com.starrocks.thrift.TExecPlanFragmentParams;
+import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TPartitionType;
 import com.starrocks.thrift.TPlanFragmentExecParams;
 import com.starrocks.thrift.TQueryGlobals;
 import com.starrocks.thrift.TQueryOptions;
@@ -69,6 +82,7 @@ import com.starrocks.thrift.TQueryType;
 import com.starrocks.thrift.TResultSinkType;
 import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.thrift.TScanRangeParams;
+import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.thrift.TWriteQuorumType;
 import org.apache.logging.log4j.LogManager;
@@ -76,10 +90,19 @@ import org.apache.logging.log4j.Logger;
 
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 // Used to generate a plan fragment for a streaming load.
 // we only support OlapTable now.
@@ -253,6 +276,282 @@ public class StreamLoadPlanner {
                 queryOptions.getLoad_transmission_compression_type(), destTable.enableReplicatedStorage(),
                 writeQuorum);
         return params;
+    }
+
+    // create the plan. the plan's query id and load id are same, using the parameter 'loadId'
+    public TExecPlanFragmentParams shufflePlan(TUniqueId loadId, int tabletSinkDop) throws UserException {
+        boolean isPrimaryKey = destTable.getKeysType() == KeysType.PRIMARY_KEYS;
+        resetAnalyzer();
+        // construct tuple descriptor, used for scanNode and dataSink
+        TupleDescriptor tupleDesc = descTable.createTupleDescriptor("DstTableTuple");
+        boolean negative = streamLoadInfo.getNegative();
+        if (isPrimaryKey) {
+            if (negative) {
+                throw new DdlException("Primary key table does not support negative load");
+            }
+        } else {
+            if (streamLoadInfo.isPartialUpdate()) {
+                throw new DdlException("Only primary key table support partial update");
+            }
+        }
+        List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
+        List<Column> destColumns;
+        List<Boolean> missAutoIncrementColumn = Lists.newArrayList();
+        if (streamLoadInfo.isPartialUpdate()) {
+            destColumns = Load.getPartialUpateColumns(destTable, streamLoadInfo.getColumnExprDescs(), missAutoIncrementColumn);
+        } else {
+            destColumns = destTable.getFullSchema();
+        }
+        for (Column col : destColumns) {
+            SlotDescriptor slotDesc = descTable.addSlotDescriptor(tupleDesc);
+            slotDesc.setIsMaterialized(true);
+            slotDesc.setColumn(col);
+            slotDesc.setIsNullable(col.isAllowNull());
+            if (negative && !col.isKey() && col.getAggregationType() != AggregateType.SUM) {
+                throw new DdlException("Column is not SUM AggreateType. column:" + col.getName());
+            }
+
+            if (col.getType().isVarchar() && Config.enable_dict_optimize_stream_load &&
+                    IDictManager.getInstance().hasGlobalDict(destTable.getId(),
+                            col.getName())) {
+                Optional<ColumnDict> dict = IDictManager.getInstance().getGlobalDict(destTable.getId(), col.getName());
+                dict.ifPresent(columnDict -> globalDicts.add(new Pair<>(slotDesc.getId().asInt(), columnDict)));
+            }
+        }
+        if (isPrimaryKey) {
+            // add op type column
+            SlotDescriptor slotDesc = descTable.addSlotDescriptor(tupleDesc);
+            slotDesc.setIsMaterialized(true);
+            slotDesc.setColumn(new Column(Load.LOAD_OP_COLUMN, Type.TINYINT));
+            slotDesc.setIsNullable(false);
+        }
+
+        // create scan node
+        StreamLoadScanNode scanNode =
+                new StreamLoadScanNode(loadId, new PlanNodeId(0), tupleDesc, destTable, streamLoadInfo);
+        scanNode.setUseVectorizedLoad(true);
+        scanNode.init(analyzer);
+        scanNode.finalizeStats(analyzer);
+
+        descTable.computeMemLayout();
+
+        // for stream load, we only need one fragment, ScanNode -> DataSink.
+        // OlapTableSink can dispatch data to corresponding node.
+        PlanFragment scanFragment = new PlanFragment(new PlanFragmentId(0), scanNode, DataPartition.UNPARTITIONED);
+        boolean needHashPartition = needHashPartition();
+
+        DataPartition dataPartition;
+        if (needHashPartition) {
+            List<Column> keyColumns = destTable.getKeyColumnsByIndexId(destTable.getBaseIndexId());
+            List<Expr> partitionExprs = Lists.newArrayList();
+            keyColumns.forEach(column -> {
+                partitionExprs.add(new SlotRef(tupleDesc.getColumnSlot(column.getName())));
+            });
+            dataPartition = new DataPartition(TPartitionType.HASH_PARTITIONED, partitionExprs);
+        } else {
+            dataPartition = new DataPartition(TPartitionType.RANDOM);
+        }
+
+        ExchangeNode exchangeNode = new ExchangeNode(new PlanNodeId(1), scanFragment.getPlanRoot(),
+                dataPartition);
+        PlanFragment sinkFragment = new PlanFragment(new PlanFragmentId(1), exchangeNode, dataPartition);
+        exchangeNode.setFragment(sinkFragment);
+        scanFragment.setDestination(exchangeNode);
+        scanFragment.setOutputPartition(dataPartition);
+
+        // create dest sink
+        TWriteQuorumType writeQuorum = destTable.writeQuorum();
+
+        List<Long> partitionIds = getAllPartitionIds();
+        OlapTableSink olapTableSink = new OlapTableSink(destTable, tupleDesc, partitionIds, writeQuorum,
+                destTable.enableReplicatedStorage(), scanNode.nullExprInAutoIncrement());
+        if (missAutoIncrementColumn.size() == 1 && missAutoIncrementColumn.get(0) == Boolean.TRUE) {
+            olapTableSink.setMissAutoIncrementColumn();
+        }
+        olapTableSink.init(loadId, streamLoadInfo.getTxnId(), db.getId(), streamLoadInfo.getTimeout());
+        Load.checkMergeCondition(streamLoadInfo.getMergeConditionStr(), destTable, olapTableSink.missAutoIncrementColumn());
+        olapTableSink.complete(streamLoadInfo.getMergeConditionStr());
+
+        sinkFragment.setSink(olapTableSink);
+        sinkFragment.setPipelineDop(tabletSinkDop);
+        sinkFragment.setLoadGlobalDicts(globalDicts);
+        sinkFragment.createDataSink(TResultSinkType.MYSQL_PROTOCAL);
+
+        List<PlanFragment> fragments = Lists.newArrayList();
+        List<ScanNode> scanNodes = Lists.newArrayList();
+        fragments.add(sinkFragment);
+        fragments.add(scanFragment);
+        scanNodes.add(scanNode);
+
+        Coordinator curCoordinator = new Coordinator(loadId.getHi(), loadId, destTable,
+                descTable, fragments, scanNodes, streamLoadInfo.getTimezone(), new Date().getTime(),
+                streamLoadInfo.getTimeout(), streamLoadInfo.getTransmisionCompressionType(),
+                streamLoadInfo.getLoadParallelRequestNum(), streamLoadInfo.getExecMemLimit(), streamLoadInfo.getLoadMemLimit());
+
+
+        CoordinatorPreprocessor preprocessor = curCoordinator.getPrepareInfo();
+        try {
+            preprocessor.prepareExec2();
+        } catch (Exception e) {
+            throw new UserException(e.getMessage());
+        }
+
+        for (PlanFragment fragment : fragments) {
+            CoordinatorPreprocessor.FragmentExecParams params = preprocessor.getFragmentExecParamsMap().get(fragment.getFragmentId());
+            int instanceNum = params.instanceExecParams.size();
+            Preconditions.checkState(instanceNum > 0);
+            List<List<CoordinatorPreprocessor.FInstanceExecParam>> infightExecParamList = new LinkedList<>();
+
+            // // Fragment instances' ordinals in FragmentExecParams.instanceExecParams determine
+            // // shuffle partitions' ordinals in DataStreamSink. backendIds of Fragment instances that
+            // // contain shuffle join determine the ordinals of GRF components in the GRF. For a
+            // // shuffle join, its shuffle partitions and corresponding one-map-one GRF components
+            // // should have the same ordinals. so here assign monotonic unique backendIds to
+            // // Fragment instances to keep consistent order with Fragment instances in
+            // // FragmentExecParams.instanceExecParams.
+            // for (CoordinatorPreprocessor.FInstanceExecParam fInstanceExecParam : params.instanceExecParams) {
+            //     fInstanceExecParam.backendNum = 1;
+            // }
+            infightExecParamList.add(params.instanceExecParams);
+
+            boolean isFirst = true;
+            for (List<CoordinatorPreprocessor.FInstanceExecParam> fInstanceExecParamList : infightExecParamList) {
+                TDescriptorTable descTable = new TDescriptorTable();
+                descTable.setIs_cached(true);
+                descTable.setTupleDescriptors(Collections.emptyList());
+                if (isFirst) {
+                    descTable = descTable;
+                    descTable.setIs_cached(false);
+                    isFirst = false;
+                }
+
+                if (fInstanceExecParamList.isEmpty()) {
+                    continue;
+                }
+
+                Map<TUniqueId, TNetworkAddress> instanceId2Host =
+                        fInstanceExecParamList.stream().collect(Collectors.toMap(f -> f.instanceId, f -> f.host));
+                try {
+                    List<TExecPlanFragmentParams> tParams =
+                            params.toThrift(instanceId2Host.keySet(), descTable, false,
+                                    0, 0, false);
+                } catch (Exception e) {
+                    throw new UserException(e.getMessage());
+                }
+            }
+        }
+
+        List<TExecPlanFragmentParams> paramsList = Lists.newArrayList();
+
+        TExecPlanFragmentParams scanParams = new TExecPlanFragmentParams();
+        scanParams.setProtocol_version(InternalServiceVersion.V1);
+        scanParams.setFragment(scanFragment.toThrift());
+        scanParams.setDesc_tbl(analyzer.getDescTbl().toThrift());
+
+        TPlanFragmentExecParams execParams = new TPlanFragmentExecParams();
+        // user load id (streamLoadInfo.id) as query id
+        execParams.setQuery_id(loadId);
+        execParams.setFragment_instance_id(new TUniqueId(loadId.hi, loadId.lo + 1));
+        execParams.per_exch_num_senders = Maps.newHashMap();
+        execParams.destinations = Lists.newArrayList();
+        Map<Integer, List<TScanRangeParams>> perNodeScanRange = Maps.newHashMap();
+        List<TScanRangeParams> scanRangeParams = Lists.newArrayList();
+        for (TScanRangeLocations locations : scanNode.getScanRangeLocations(0)) {
+            scanRangeParams.add(new TScanRangeParams(locations.getScan_range()));
+        }
+        execParams.setSender_id(0);
+        execParams.setNum_senders(1);
+        perNodeScanRange.put(scanNode.getId().asInt(), scanRangeParams);
+        execParams.setPer_node_scan_ranges(perNodeScanRange);
+        scanParams.setParams(execParams);
+        paramsList.add(scanParams);
+
+
+        for (int i = 0; i < tabletSinkDop; i++) {
+            TExecPlanFragmentParams Params = new TExecPlanFragmentParams();
+            scanParams.setProtocol_version(InternalServiceVersion.V1);
+            scanParams.setFragment(sinkFragment.toThrift());
+            scanParams.setDesc_tbl(analyzer.getDescTbl().toThrift());
+
+            TPlanFragmentExecParams execParams = new TPlanFragmentExecParams();
+            // user load id (streamLoadInfo.id) as query id
+            execParams.setQuery_id(loadId);
+            execParams.setFragment_instance_id(new TUniqueId(loadId.hi, loadId.lo + 1));
+            execParams.per_exch_num_senders = Maps.newHashMap();
+            execParams.destinations = Lists.newArrayList();
+            Map<Integer, List<TScanRangeParams>> perNodeScanRange = Maps.newHashMap();
+            List<TScanRangeParams> scanRangeParams = Lists.newArrayList();
+            for (TScanRangeLocations locations : scanNode.getScanRangeLocations(0)) {
+                scanRangeParams.add(new TScanRangeParams(locations.getScan_range()));
+            }
+            execParams.setSender_id(0);
+            execParams.setNum_senders(1);
+            perNodeScanRange.put(scanNode.getId().asInt(), scanRangeParams);
+            execParams.setPer_node_scan_ranges(perNodeScanRange);
+            scanParams.setParams(execParams);
+        }
+
+        TQueryOptions queryOptions = new TQueryOptions();
+        queryOptions.setQuery_type(TQueryType.LOAD);
+        queryOptions.setQuery_timeout(streamLoadInfo.getTimeout());
+        queryOptions.setLoad_transmission_compression_type(streamLoadInfo.getTransmisionCompressionType());
+
+        // Disable load_dop for LakeTable temporary, because BE's `LakeTabletsChannel` does not support
+        // parallel send from a single sender.
+        if (streamLoadInfo.getLoadParallelRequestNum() != 0 && !destTable.isLakeTable()) {
+            // only dup_keys can use parallel write since other table's the order of write is important
+            if (destTable.getKeysType() == KeysType.DUP_KEYS) {
+                queryOptions.setLoad_dop(streamLoadInfo.getLoadParallelRequestNum());
+            } else {
+                queryOptions.setLoad_dop(1);
+            }
+        }
+        // for stream load, we use exec_mem_limit to limit the memory usage of load channel.
+        queryOptions.setMem_limit(streamLoadInfo.getExecMemLimit());
+        queryOptions.setLoad_mem_limit(streamLoadInfo.getLoadMemLimit());
+        scanParams.setQuery_options(queryOptions);
+        TQueryGlobals queryGlobals = new TQueryGlobals();
+        queryGlobals.setNow_string(DATE_FORMAT.format(new Date()));
+        queryGlobals.setTimestamp_ms(new Date().getTime());
+        queryGlobals.setTime_zone(streamLoadInfo.getTimezone());
+        scanParams.setQuery_globals(queryGlobals);
+
+
+        LOG.info("load job id: {} tx id {} parallel {} compress {} replicated {} quorum {}", DebugUtil.printId(loadId),
+                streamLoadInfo.getTxnId(),
+                queryOptions.getLoad_dop(),
+                queryOptions.getLoad_transmission_compression_type(), destTable.enableReplicatedStorage(),
+                writeQuorum);
+        return scanParams;
+    }
+
+    public Boolean needHashPartition() {
+        if (KeysType.DUP_KEYS.equals(destTable.getKeysType())) {
+            return false;
+        }
+
+        if (destTable.getDefaultReplicationNum() <= 1) {
+            return false;
+        }
+
+        if (destTable.enableReplicatedStorage()) {
+            return false;
+        }
+
+        if (KeysType.AGG_KEYS.equals(destTable.getKeysType())) {
+            for (Map.Entry<Long, List<Column>> entry : destTable.getIndexIdToSchema().entrySet()) {
+                List<Column> schema = entry.getValue();
+                for (Column column : schema) {
+                    if (column.getAggregationType() == AggregateType.REPLACE
+                            || column.getAggregationType() == AggregateType.REPLACE_IF_NOT_NULL) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        return true;
     }
 
     // get all specified partition ids.

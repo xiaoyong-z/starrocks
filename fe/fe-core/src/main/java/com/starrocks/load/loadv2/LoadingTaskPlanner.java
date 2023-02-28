@@ -285,8 +285,6 @@ public class LoadingTaskPlanner {
         fragments.add(scanFragment);
 
         // 5. Exchange node
-        List<Column> columns = table.getFullSchema();
-
         List<Column> keyColumns = table.getKeyColumnsByIndexId(table.getBaseIndexId());
         List<Expr> partitionExprs = Lists.newArrayList();
         keyColumns.forEach(column -> {

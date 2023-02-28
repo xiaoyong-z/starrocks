@@ -282,6 +282,8 @@ public abstract class RoutineLoadJob extends AbstractTxnStateChangeCallback impl
             sessionVariables.put(SessionVariable.SQL_MODE, Long.toString(var.getSqlMode()));
             sessionVariables.put(SessionVariable.EXEC_MEM_LIMIT, Long.toString(var.getMaxExecMemByte()));
             sessionVariables.put(SessionVariable.LOAD_TRANSMISSION_COMPRESSION_TYPE, var.getloadTransmissionCompressionType());
+            sessionVariables.put(SessionVariable.ROUTINE_LOAD_TABLET_SINK_DOP, Integer.toString(
+                    var.getRoutineLoadTabletSinkDop()));
         } else {
             sessionVariables.put(SessionVariable.SQL_MODE, String.valueOf(SqlModeHelper.MODE_DEFAULT));
             sessionVariables.put(SessionVariable.EXEC_MEM_LIMIT, Long.toString(SessionVariable.DEFAULT_EXEC_MEM_LIMIT));
@@ -738,7 +740,13 @@ public abstract class RoutineLoadJob extends AbstractTxnStateChangeCallback impl
             }
             StreamLoadPlanner planner =
                     new StreamLoadPlanner(db, (OlapTable) table, StreamLoadInfo.fromRoutineLoadJob(this));
-            TExecPlanFragmentParams planParams = planner.plan(loadId);
+            TExecPlanFragmentParams planParams;
+            int tabletSinkDop = Integer.parseInt(sessionVariables.get(SessionVariable.ROUTINE_LOAD_TABLET_SINK_DOP));
+            if (tabletSinkDop == 1 || planner.getDestTable().isLakeTable()) {
+                planParams = planner.plan(loadId);
+            } else {
+                planParams = planner.shufflePlan(loadId, tabletSinkDop);
+            }
             planParams.query_options.setLoad_job_type(TLoadJobType.ROUTINE_LOAD);
             // add table indexes to transaction state
             TransactionState txnState =

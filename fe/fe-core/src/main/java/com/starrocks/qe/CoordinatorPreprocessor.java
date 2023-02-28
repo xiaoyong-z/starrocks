@@ -119,7 +119,7 @@ public class CoordinatorPreprocessor {
     private final TQueryGlobals queryGlobals;
     private final TQueryOptions queryOptions;
 
-    private final boolean usePipeline;
+    private boolean usePipeline;
     // if it has compute node, hasComputeNode is true
     private boolean hasComputeNode = false;
     // when use compute node, usedComputeNode is true,
@@ -166,7 +166,7 @@ public class CoordinatorPreprocessor {
     // Resource group
     private TWorkGroup resourceGroup = null;
 
-    public CoordinatorPreprocessor(TUniqueId queryId, ConnectContext context, List<PlanFragment> fragments,
+    public CoordinatorPreprocessor(TUniqueId c, ConnectContext context, List<PlanFragment> fragments,
                                    List<ScanNode> scanNodes, TDescriptorTable descriptorTable,
                                    TQueryGlobals queryGlobals, TQueryOptions queryOptions) {
         this.connectContext = context;
@@ -238,6 +238,10 @@ public class CoordinatorPreprocessor {
 
     public boolean isUsePipeline() {
         return usePipeline;
+    }
+
+    public void setUsePipeline(boolean usePipeline) {
+        this.usePipeline = usePipeline; 
     }
 
     public TQueryGlobals getQueryGlobals() {
@@ -361,6 +365,22 @@ public class CoordinatorPreprocessor {
     }
 
     public void prepareExec() throws Exception {
+        // prepare information
+        resetFragmentState();
+        prepareFragments();
+
+        // prepare workgroup
+        resourceGroup = prepareResourceGroup(connectContext,
+                    queryOptions.getQuery_type() == TQueryType.LOAD ? ResourceGroupClassifier.QueryType.INSERT
+                        : ResourceGroupClassifier.QueryType.SELECT);
+
+        computeScanRangeAssignment();
+        computeFragmentExecParams();
+        traceInstance();
+        computeBeInstanceNumbers();
+    }
+
+    public void prepareExec2() throws Exception {
         // prepare information
         resetFragmentState();
         prepareFragments();
@@ -1373,8 +1393,8 @@ public class CoordinatorPreprocessor {
         static final int ABSENT_PIPELINE_DOP = -1;
         static final int ABSENT_DRIVER_SEQUENCE = -1;
 
-        TUniqueId instanceId;
-        TNetworkAddress host;
+        public TUniqueId instanceId;
+        public TNetworkAddress host;
         Map<Integer, List<TScanRangeParams>> perNodeScanRanges = Maps.newHashMap();
         Map<Integer, Map<Integer, List<TScanRangeParams>>> nodeToPerDriverSeqScanRanges = Maps.newHashMap();
 
